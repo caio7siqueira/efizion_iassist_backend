@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from twilio.rest import Client as TwilioClient
-from fastapi import Reques
+from fastapi import Request
 import os
 
 load_dotenv()
@@ -55,7 +55,7 @@ def vendas_hoje():
     }
 
 
-app.post("/webhook")
+@app.post("/webhook")
 async def whatsapp_webhook(request: Request):
     form = await request.form()
     mensagem_recebida = form.get("Body", "").strip().lower()
@@ -119,5 +119,6 @@ async def whatsapp_webhook(request: Request):
     )
 
     return {"status": "mensagem processada"}
+
 
 
