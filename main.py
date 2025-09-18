@@ -57,6 +57,12 @@ def vendas_hoje():
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
+    
+    try:
+        form = await request.form()
+    except Exception as e:
+        return {"error": f"Erro ao processar formulário: {str(e)}"}
+
     form = await request.form()
     mensagem_recebida = form.get("Body", "").strip().lower()
     numero_remetente = form.get("From")
@@ -119,6 +125,7 @@ async def whatsapp_webhook(request: Request):
     )
 
     return {"status": "mensagem processada"}
+
 
 
 
