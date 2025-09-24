@@ -1,131 +1,89 @@
-from fastapi import FastAPI
-from supabase import create_client, Client
 from dotenv import load_dotenv
-from twilio.rest import Client as TwilioClient
-from fastapi import Request
 import os
 
 load_dotenv()
 
-# Supabase
+from fastapi import FastAPI, Request
+from supabase import create_client, Client
+from twilio.rest import Client as TwilioClient
+import openai
+
+# Variáveis de ambiente
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-TELEFONE_CLIENTE = os.getenv("TELEFONE_CLIENTE")
+TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Twilio
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-GESTOR_NUMBER = os.getenv("GESTOR_WHATSAPP_NUMBER")  # número do gestor
-
+# Inicialização
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+openai.api_key = OPENAI_API_KEY
 
 app = FastAPI()
 
-@app.get("/vendas-hoje")
-def vendas_hoje():
-    cliente = supabase.table("clientes").select("id").eq("telefone", TELEFONE_CLIENTE).single().execute()
-    if not cliente.data:
-        return {"error": "Cliente não encontrado"}
-
-    cliente_id = cliente.data["id"]
-
-    vendas = supabase.table("vendas") \
-        .select("valor", "qtd") \
-        .eq("cliente_id", cliente_id) \
-        .gte("data", "today") \
-        .execute()
-
-    total = sum(v["valor"] * v["qtd"] for v in vendas.data)
-
-    mensagem = f"📊 Indicador de hoje:\nTotal vendido: R$ {total:.2f}"
-
-    # Enviar via WhatsApp
-    message = twilio_client.messages.create(
-        body=mensagem,
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=GESTOR_NUMBER
+# Função de interpretação com IA
+def interpretar_mensagem(mensagem):
+    prompt = f"""
+    Você é um assistente que interpreta mensagens de gestores e extrai filtros para consulta de indicadores.
+    Mensagem: "{mensagem}"
+    Retorne um JSON com os campos: tipo_consulta, data, categoria_produto.
+    """
+    resposta = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
     )
-
-    return {
-        "total_vendido_hoje": total,
-        "mensagem_enviada": mensagem,
-        "sid": message.sid
-    }
-
+    conteudo = resposta.choices[0].message.content
+    try:
+        return eval(conteudo)
+    except:
+        return {}
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
-    
-    try:
-        form = await request.form()
-    except Exception as e:
-        return {"error": f"Erro ao processar formulário: {str(e)}"}
-
     form = await request.form()
-    mensagem_recebida = form.get("Body", "").strip().lower()
-    numero_remetente = form.get("From")
+    mensagem = form.get("Body", "").strip()
+    numero = form.get("From", "").replace("whatsapp:", "")
 
-    cliente = supabase.table("clientes").select("id").eq("telefone", TELEFONE_CLIENTE).single().execute()
-    if not cliente.data:
-        resposta = "Cliente não encontrado."
+    gestor = supabase.table("gestores").select("cliente_id").eq("telefone_whatsapp", numero).single().execute()
+    if not gestor.data:
+        resposta = "Gestor não autorizado."
     else:
-        cliente_id = cliente.data["id"]
+        cliente_id = gestor.data["cliente_id"]
+        supabase.rpc("set_config", {"key": "gestor.telefone", "value": numero})
 
-        if "total" in mensagem_recebida:
-            vendas = supabase.table("vendas") \
-                .select("valor", "qtd") \
-                .eq("cliente_id", cliente_id) \
-                .gte("data", "today") \
-                .execute()
-            total = sum(v["valor"] * v["qtd"] for v in vendas.data)
-            resposta = f"📊 Total vendido hoje: R$ {total:.2f}"
+        filtros = interpretar_mensagem(mensagem)
+        registros = supabase.table("registros").select("dados").execute()
 
-        elif "produto" in mensagem_recebida:
-            vendas = supabase.table("vendas") \
-                .select("produto", "qtd") \
-                .eq("cliente_id", cliente_id) \
-                .execute()
+        if filtros.get("tipo_consulta") == "total_vendas":
+            total = sum(r["dados"].get("valor_total", 0) for r in registros.data)
+            resposta = f"📊 Total vendido: R$ {total:.2f}"
 
-            if not vendas.data:
+        elif filtros.get("tipo_consulta") == "mais_vendido":
+            contagem = {}
+            for r in registros.data:
+                produto = r["dados"].get("categoria_produto")
+                qtd = r["dados"].get("quantidade", 0)
+                if produto:
+                    contagem[produto] = contagem.get(produto, 0) + qtd
+            if contagem:
+                mais_vendido = max(contagem, key=contagem.get)
+                resposta = f"🏆 Produto mais vendido: {mais_vendido} – {contagem[mais_vendido]} unidades"
+            else:
                 resposta = "Nenhuma venda registrada."
-            else:
-                produto_quantidade = {}
-                for venda in vendas.data:
-                    produto = venda["produto"]
-                    qtd = venda["qtd"]
-                    produto_quantidade[produto] = produto_quantidade.get(produto, 0) + qtd
-
-                produto_mais_vendido = max(produto_quantidade, key=produto_quantidade.get)
-                total_vendido = produto_quantidade[produto_mais_vendido]
-                resposta = f"🏆 Produto mais vendido:\n{produto_mais_vendido} – {total_vendido} unidades"
-
-        elif "estoque" in mensagem_recebida:
-            estoque = supabase.table("estoque") \
-                .select("produto", "qtd_atual", "qtd_minima") \
-                .eq("cliente_id", cliente_id) \
-                .lt("qtd_atual", "qtd_minima") \
-                .execute()
-
-            if not estoque.data:
-                resposta = "✅ Todos os produtos estão com estoque acima do mínimo."
-            else:
-                lista = "\n".join([f"{item['produto']}: {item['qtd_atual']} unid (mínimo: {item['qtd_minima']})" for item in estoque.data])
-                resposta = f"⚠️ Produtos com estoque baixo:\n{lista}"
 
         else:
-            resposta = "❓ Comando não reconhecido.\nEnvie:\n- 'total' para ver vendas de hoje\n- 'produto' para ver o mais vendido\n- 'estoque' para ver produtos críticos"
+            resposta = (
+                "❓ Comando não reconhecido.\n"
+                "Envie algo como:\n"
+                "- 'total de vendas hoje'\n"
+                "- 'produto mais vendido'"
+            )
 
-    # Enviar resposta via WhatsApp
     twilio_client.messages.create(
         body=resposta,
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=numero_remetente
+        from_=TWILIO_NUMBER,
+        to=form.get("From")
     )
-
-    return {"status": "mensagem processada"}
-
-
-
-
+    return {"status": "mensagem enviada", "resposta": resposta}
