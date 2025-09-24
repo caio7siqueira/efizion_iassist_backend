@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 import os
 import json
 import logging
+import re
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
 from twilio.rest import Client as TwilioClient
@@ -39,23 +40,12 @@ def interpretar_mensagem(mensagem: str) -> Dict[str, Any]:
     1. Identificar a intenção (ex.: consultar vendas, lucros, produto mais vendido).
     2. Extrair filtros como data (ex.: '2023-10', 'este mês'), loja (ex.: 'Loja A'), produto (ex.: 'Camiseta').
     3. Normalizar datas para o formato 'YYYY-MM' ou 'YYYY' quando aplicável.
-    4. Retornar um JSON com os campos: tipo_consulta, indicador_nome, filtros (contendo data, loja, produto, se aplicável).
+    4. Retorne APENAS o JSON válido, sem texto adicional, explicações ou formatação Markdown. O JSON deve conter: tipo_consulta, indicador_nome, filtros.
 
-    Exemplo de saída:
-    ```json
-    {
-        "tipo_consulta": "indicador",
-        "indicador_nome": "total_vendas",
-        "filtros": {
-            "data": "2023-10",
-            "loja": "Loja A",
-            "produto": "Camiseta"
-        }
-    }
-    ```
+    Exemplo de saída (retorne exatamente assim, sem nada mais):
+    {{"tipo_consulta": "indicador", "indicador_nome": "total_vendas", "filtros": {{"data": "2023-10", "loja": "Loja A", "produto": "Camiseta"}}}}
 
     Mensagem recebida: "{}"
-    Retorne o JSON correspondente.
     """.format(mensagem)
     
     try:
@@ -64,10 +54,18 @@ def interpretar_mensagem(mensagem: str) -> Dict[str, Any]:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150
         )
-        conteudo = response.choices[0].message.content
-        return json.loads(conteudo)
-    except json.JSONDecodeError:
-        logger.error(f"Erro ao parsear JSON da OpenAI: {conteudo}")
+        conteudo = response.choices[0].message.content.strip()  # Remove espaços e quebras de linha extras
+        
+        # Tentar extrair JSON se houver texto extra (regex para capturar bloco JSON)
+        if not conteudo.startswith('{'):
+            match = re.search(r'\{.*\}', conteudo, re.DOTALL)
+            if match:
+                conteudo = match.group(0)
+        
+        parsed = json.loads(conteudo)
+        return parsed
+    except json.JSONDecodeError as e:
+        logger.error(f"Erro ao parsear JSON da OpenAI. Conteúdo recebido: '{conteudo}'. Erro: {e}")
         return {"tipo_consulta": "erro", "indicador_nome": "", "filtros": {}}
     except Exception as e:
         logger.error(f"Erro ao interpretar mensagem: {e}")
@@ -77,7 +75,7 @@ def interpretar_mensagem(mensagem: str) -> Dict[str, Any]:
 def executar_indicador(cliente_id: str, entidade_id: str, indicador_nome: str, filtros: Dict[str, str]) -> str:
     try:
         # Buscar indicador na tabela indicadores
-        indicador = supabase.table("indicadores").select("logica, filtros_padrao, descricao, entidade_id") \
+        indicador = supabase.table("indicadores").select("logica, filtros_padrao, descricao") \
             .eq("cliente_id", cliente_id) \
             .eq("nome", indicador_nome).single().execute()
         
@@ -87,7 +85,6 @@ def executar_indicador(cliente_id: str, entidade_id: str, indicador_nome: str, f
         logica_sql = indicador.data["logica"]
         filtros_padrao = indicador.data["filtros_padrao"] or {}
         descricao = indicador.data["descricao"]
-        entidade_id = indicador.data["entidade_id"]
         
         # Validar filtros recebidos contra filtros permitidos
         filtros_validos = {k: v for k, v in filtros.items() if k in filtros_padrao}
@@ -104,11 +101,12 @@ def executar_indicador(cliente_id: str, entidade_id: str, indicador_nome: str, f
         
         # Montar consulta SQL
         query = logica_sql
-        if where_clauses:
-            # Adicionar condições WHERE, garantindo que cliente_id e entidade_id sejam respeitados
-            query = query.replace("WHERE", f"WHERE cliente_id = :cliente_id AND entidade_id = :entidade_id AND ") + " AND ".join(where_clauses)
+        if "WHERE" in query:
+            if where_clauses:
+                query += " AND " + " AND ".join(where_clauses)
         else:
-            query = query.replace("WHERE", f"WHERE cliente_id = :cliente_id AND entidade_id = :entidade_id")
+            if where_clauses:
+                query += " WHERE " + " AND ".join(where_clauses)
         
         # Executar consulta via RPC
         result = supabase.rpc("execute_query", {"query": query, "params": query_params}).execute()
@@ -121,13 +119,17 @@ def executar_indicador(cliente_id: str, entidade_id: str, indicador_nome: str, f
             total = sum(row.get("valor", 0) for row in result.data)
             return f"📊 {descricao}: R$ {total:.2f}"
         elif indicador_nome == "produto_mais_vendido":
-            produto = result.data[0]["produto"]
-            quantidade = result.data[0]["total_quantidade"]
-            return f"🏆 {descricao}: {produto} – {quantidade} unidades"
+            if result.data:
+                produto = result.data[0].get("produto", "N/A")
+                quantidade = result.data[0].get("total_quantidade", 0)
+                return f"🏆 {descricao}: {produto} – {quantidade} unidades"
+            return "Nenhum produto encontrado."
         elif indicador_nome == "vendas_por_genero":
             resposta = f"📊 {descricao}:\n"
             for row in result.data:
-                resposta += f"- {row['genero']}: R$ {row['valor']:.2f}\n"
+                genero = row.get("genero", "N/A")
+                valor = row.get("valor", 0)
+                resposta += f"- {genero}: R$ {valor:.2f}\n"
             return resposta
         else:
             return "📉 Resultado não formatado para este indicador."
@@ -173,9 +175,9 @@ async def whatsapp_webhook(request: Request):
             # Interpretar mensagem
             resultado = interpretar_mensagem(mensagem)
             if resultado.get("tipo_consulta") == "erro":
-                resposta = "❓ Não entendi sua solicitação."
+                resposta = "❓ Não entendi sua solicitação. Tente reformular."
             elif resultado.get("tipo_consulta") == "indicador":
-                # Buscar entidade_id associada ao cliente (assumindo uma entidade padrão por cliente para simplificar)
+                # Buscar entidade_id associada ao cliente (assumindo uma entidade padrão)
                 entidade = supabase.table("entidades").select("id").eq("cliente_id", cliente_id).limit(1).execute()
                 entidade_id = entidade.data[0]["id"] if entidade.data else None
                 if not entidade_id:
