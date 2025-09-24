@@ -37,8 +37,9 @@ def interpretar_mensagem(mensagem: str) -> Dict[str, Any]:
     Você é um assistente que interpreta mensagens de gestores e extrai filtros para consulta de indicadores.
     Sua tarefa é:
     1. Identificar a intenção (ex.: consultar vendas, lucros, produto mais vendido).
-    2. Extrair filtros como data (ex.: '2023-10'), loja (ex.: 'Loja A'), produto (ex.: 'Camiseta').
-    3. Retornar um JSON com os campos: tipo_consulta, indicador_nome, filtros (contendo data, loja, produto, se aplicável).
+    2. Extrair filtros como data (ex.: '2023-10', 'este mês'), loja (ex.: 'Loja A'), produto (ex.: 'Camiseta').
+    3. Normalizar datas para o formato 'YYYY-MM' ou 'YYYY' quando aplicável.
+    4. Retornar um JSON com os campos: tipo_consulta, indicador_nome, filtros (contendo data, loja, produto, se aplicável).
 
     Exemplo de saída:
     ```json
@@ -73,10 +74,10 @@ def interpretar_mensagem(mensagem: str) -> Dict[str, Any]:
         return {"tipo_consulta": "erro", "indicador_nome": "", "filtros": {}}
 
 # Função para executar indicadores dinâmicos
-def executar_indicador(cliente_id: str, indicador_nome: str, filtros: Dict[str, str]) -> str:
+def executar_indicador(cliente_id: str, entidade_id: str, indicador_nome: str, filtros: Dict[str, str]) -> str:
     try:
         # Buscar indicador na tabela indicadores
-        indicador = supabase.table("indicadores").select("logica, filtros_padrao") \
+        indicador = supabase.table("indicadores").select("logica, filtros_padrao, descricao, entidade_id") \
             .eq("cliente_id", cliente_id) \
             .eq("nome", indicador_nome).single().execute()
         
@@ -85,12 +86,14 @@ def executar_indicador(cliente_id: str, indicador_nome: str, filtros: Dict[str, 
         
         logica_sql = indicador.data["logica"]
         filtros_padrao = indicador.data["filtros_padrao"] or {}
+        descricao = indicador.data["descricao"]
+        entidade_id = indicador.data["entidade_id"]
         
         # Validar filtros recebidos contra filtros permitidos
         filtros_validos = {k: v for k, v in filtros.items() if k in filtros_padrao}
         
         # Construir consulta SQL com filtros
-        query_params = {"cliente_id": cliente_id}
+        query_params = {"cliente_id": cliente_id, "entidade_id": entidade_id}
         where_clauses = []
         
         for filtro, valor in filtros_validos.items():
@@ -102,17 +105,32 @@ def executar_indicador(cliente_id: str, indicador_nome: str, filtros: Dict[str, 
         # Montar consulta SQL
         query = logica_sql
         if where_clauses:
-            query += " WHERE " + " AND ".join(where_clauses)
+            # Adicionar condições WHERE, garantindo que cliente_id e entidade_id sejam respeitados
+            query = query.replace("WHERE", f"WHERE cliente_id = :cliente_id AND entidade_id = :entidade_id AND ") + " AND ".join(where_clauses)
+        else:
+            query = query.replace("WHERE", f"WHERE cliente_id = :cliente_id AND entidade_id = :entidade_id")
         
-        # Executar consulta via RPC (assumindo que existe uma função RPC 'execute_query')
+        # Executar consulta via RPC
         result = supabase.rpc("execute_query", {"query": query, "params": query_params}).execute()
         
         if not result.data:
-            return "📉 Nenhuma dado encontrado para os filtros fornecidos."
+            return "📉 Nenhum dado encontrado para os filtros fornecidos."
         
-        # Formatando o resultado (exemplo simples, ajustar conforme lógica do indicador)
-        total = sum(row.get("valor", 0) for row in result.data)
-        return f"📊 Resultado do indicador '{indicador_nome}': R$ {total:.2f}"
+        # Formatar resultado com base no indicador
+        if indicador_nome == "total_vendas":
+            total = sum(row.get("valor", 0) for row in result.data)
+            return f"📊 {descricao}: R$ {total:.2f}"
+        elif indicador_nome == "produto_mais_vendido":
+            produto = result.data[0]["produto"]
+            quantidade = result.data[0]["total_quantidade"]
+            return f"🏆 {descricao}: {produto} – {quantidade} unidades"
+        elif indicador_nome == "vendas_por_genero":
+            resposta = f"📊 {descricao}:\n"
+            for row in result.data:
+                resposta += f"- {row['genero']}: R$ {row['valor']:.2f}\n"
+            return resposta
+        else:
+            return "📉 Resultado não formatado para este indicador."
     
     except Exception as e:
         logger.error(f"Erro ao executar indicador '{indicador_nome}': {e}")
@@ -133,33 +151,50 @@ async def whatsapp_webhook(request: Request):
             raise HTTPException(status_code=400, detail="Mensagem ou número ausentes")
         
         # Verificar gestor
-        gestor = supabase.table("gestores").select("cliente_id") \
-            .eq("telefone_whatsapp", numero).single().execute()
+        gestor = supabase.table("gestores").select("cliente_id").eq("telefone_whatsapp", numero).single().execute()
         
         if not gestor.data:
             resposta = "Gestor não autorizado."
         else:
             cliente_id = gestor.data["cliente_id"]
             # Configurar RLS
-            supabase.rpc("set_config", {"key": "gestor.telefone", "value": numero}).execute()
+            try:
+                supabase.rpc("set_config", {"key": "telefone", "value": numero}).execute()
+            except Exception as e:
+                logger.error(f"Erro ao configurar RLS: {e}")
+                resposta = "❌ Erro ao configurar permissões."
+                twilio_client.messages.create(
+                    body=resposta,
+                    from_=TWILIO_NUMBER,
+                    to=f"whatsapp:{numero}"
+                )
+                return {"status": "erro", "resposta": resposta}
             
             # Interpretar mensagem
             resultado = interpretar_mensagem(mensagem)
             if resultado.get("tipo_consulta") == "erro":
                 resposta = "❓ Não entendi sua solicitação."
             elif resultado.get("tipo_consulta") == "indicador":
-                # Executar indicador dinâmico
-                resposta = executar_indicador(
-                    cliente_id, 
-                    resultado.get("indicador_nome", ""), 
-                    resultado.get("filtros", {})
-                )
+                # Buscar entidade_id associada ao cliente (assumindo uma entidade padrão por cliente para simplificar)
+                entidade = supabase.table("entidades").select("id").eq("cliente_id", cliente_id).limit(1).execute()
+                entidade_id = entidade.data[0]["id"] if entidade.data else None
+                if not entidade_id:
+                    resposta = "❌ Nenhuma entidade encontrada para este cliente."
+                else:
+                    # Executar indicador dinâmico
+                    resposta = executar_indicador(
+                        cliente_id,
+                        entidade_id,
+                        resultado.get("indicador_nome", ""),
+                        resultado.get("filtros", {})
+                    )
             else:
                 resposta = (
                     "❓ Comando não reconhecido.\n"
                     "Envie algo como:\n"
-                    "- 'total de vendas hoje'\n"
-                    "- 'produto mais vendido na Loja A'"
+                    "- 'Total de vendas hoje'\n"
+                    "- 'Produto mais vendido na Loja A'\n"
+                    "- 'Vendas por gênero em 2023'"
                 )
         
         # Enviar resposta via Twilio
