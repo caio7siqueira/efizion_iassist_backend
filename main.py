@@ -54,6 +54,9 @@ async def webhook(request: Request):
 
         # Enviar resposta como texto livre (sem template, para replies)
         try:
+            # Mensagem simples para evitar erro 63005
+            message_body = f"Olá! O total de vendas é R$ {valor:,.2f}. Caso precise de mais detalhes, estou à disposição."
+
             message = twilio_client.messages.create(
                 body=message_body,
                 from_=twilio_whatsapp_number,
