@@ -3,6 +3,7 @@ import logging
 from dotenv import load_dotenv
 import os
 from fastapi import FastAPI, Request
+from twilio.rest import Client
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -12,14 +13,21 @@ app = FastAPI()
 
 supabase_url = os.getenv('SUPABASE_URL')
 supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-if not supabase_url or not supabase_key:
-    logger.error("Erro: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não estão definidos no .env")
+twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+twilio_whatsapp_number = os.getenv('TWILIO_WHATSAPP_NUMBER')
+
+if not all([supabase_url, supabase_key, twilio_account_sid, twilio_auth_token, twilio_whatsapp_number]):
+    logger.error(
+        "Erro: Variáveis de ambiente ausentes (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER)")
     exit(1)
+
+twilio_client = Client(twilio_account_sid, twilio_auth_token)
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.form()  # Twilio envia dados como form-data
+    data = await request.form()
     logger.info(f"Webhook recebido: {dict(data)}")
 
     cliente_id = "00000000-0000-0000-0000-000000000001"  # Substitua pela lógica real
@@ -40,8 +48,18 @@ async def webhook(request: Request):
 
     logger.info(f"Resposta: {response.status_code} - {response.json()}")
     if response.status_code == 200:
-        logger.info("Sucesso! Resultado: %s", response.json())
-        return {"status": "sucesso", "resultado": response.json()}
+        result = response.json()
+        valor = result[0]["valor"]
+        message_body = f"Total de vendas: R${valor:,.2f}"
+        logger.info("Sucesso! Resultado: %s", result)
+
+        # Enviar resposta ao WhatsApp
+        twilio_client.messages.create(
+            body=message_body,
+            from_=twilio_whatsapp_number,
+            to=data['From']
+        )
+        return {"status": "sucesso", "resultado": result}
     else:
         logger.error("Erro na API: %s - %s", response.status_code, response.json())
         return {"status": "error", "mensagem": response.json()}
