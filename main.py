@@ -1,30 +1,47 @@
-from fastapi import FastAPI
-from supabase import create_client, Client
+import httpx
+import logging
 from dotenv import load_dotenv
 import os
+from fastapi import FastAPI
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-TELEFONE_CLIENTE = os.getenv("TELEFONE_CLIENTE")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Criar instância do FastAPI
 app = FastAPI()
 
-@app.get("/vendas-hoje")
-def vendas_hoje():
-    cliente = supabase.table("clientes").select("id").eq("telefone", TELEFONE_CLIENTE).single().execute()
-    if not cliente.data:
-        return {"error": "Cliente não encontrado"}
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+if not supabase_url or not supabase_key:
+    logger.error("Erro: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não estão definidos no .env")
+    exit(1)
 
-    cliente_id = cliente.data["id"]
+@app.get("/test-query")
+async def test_query():
+    cliente_id = "00000000-0000-0000-0000-000000000001"
+    entidade_id = "00000000-0000-0000-0000-000000000002"
 
-    vendas = supabase.table("vendas") \
-        .select("valor", "qtd") \
-        .eq("cliente_id", cliente_id) \
-        .gte("data", "today") \
-        .execute()
+    payload = {
+        "query_text": "SELECT SUM((dados->>'valor_total')::numeric) AS valor FROM registros WHERE cliente_id = $1 AND entidade_id = $2",
+        "param1": cliente_id,
+        "param2": entidade_id
+    }
 
-    total = sum(v["valor"] * v["qtd"] for v in vendas.data)
-    return {"total_vendido_hoje": total}
+    logger.info(f"Payload enviado: {payload}")
+
+    response = httpx.post(
+        f"{supabase_url}/rest/v1/rpc/execute_query",
+        json=payload,
+        headers={"Authorization": f"Bearer {supabase_key}", "apiKey": supabase_key}
+    )
+
+    logger.info(f"Resposta: {response.status_code} - {response.json()}")
+
+    if response.status_code == 200:
+        logger.info("Sucesso! Resultado: %s", response.json())
+        return {"status": "success", "result": response.json()}
+    else:
+        logger.error("Erro na API: %s - %s", response.status_code, response.json())
+        return {"status": "error", "message": response.json()}
