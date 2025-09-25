@@ -54,22 +54,19 @@ async def webhook(request: Request):
 
         # Enviar resposta como texto livre (sem template, para replies)
         try:
-            # Mensagem simples para evitar erro 63005
-            message_body = f"Olá! O total de vendas é R$ {valor:,.2f}. Caso precise de mais detalhes, estou à disposição."
+            # Mensagem mínima e segura para teste
+            message_body = "Teste simples via WhatsApp."
 
             message = twilio_client.messages.create(
                 body=message_body,
-                from_=twilio_whatsapp_number,
-                to=data['From']
+                from_=twilio_whatsapp_number,  # deve ser 'whatsapp:+14155238886' no Sandbox
+                to=data['From']  # deve ser 'whatsapp:+55...' e ter enviado 'join <palavra>' antes
             )
-            logger.info(f"Resposta do Twilio: {message.sid} - Status: {message.status}")
-            return {"status": "sucesso", "resultado": result}
+            logger.info(f"Mensagem enviada: SID={message.sid}, Status={message.status}")
+            return {"status": "sucesso", "sid": message.sid}
         except Exception as e:
             logger.error(f"Erro ao enviar mensagem via Twilio: {str(e)}")
-            raise
-    else:
-        logger.error("Erro na API: %s - %s", response.status_code, response.json())
-        return {"status": "error", "mensagem": response.json()}
+            return {"status": "erro", "mensagem": str(e)}
 
 
 @app.get("/test-query")
