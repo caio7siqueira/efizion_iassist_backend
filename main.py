@@ -50,19 +50,24 @@ async def webhook(request: Request):
     if response.status_code == 200:
         result = response.json()
         valor = result[0]["valor"]
-        message_body = f"R${valor:,.2f}"
+        message_body = f"R${valor:,.2f}".replace(",", ".")  # Substituir vírgula por ponto para evitar problemas no JSON
         logger.info("Sucesso! Resultado: %s", result)
 
         # Usar template de teste do sandbox com content_variables como JSON
-        content_vars = json.dumps({"1": "Cliente", "2": message_body})
-        message = twilio_client.messages.create(
-            from_=twilio_whatsapp_number,
-            to=data['From'],
-            content_sid="HX8e1719f69f8c769ae4cf2ed83e4c2866",  # Template sample_issue_resolution
-            content_variables=content_vars
-        )
-        logger.info(f"Resposta do Twilio: {message.sid} - Status: {message.status}")
-        return {"status": "sucesso", "resultado": result}
+        content_vars = json.dumps({"1": "Cliente", "2": message_body}, ensure_ascii=False)
+        logger.info(f"Content variables: {content_vars}")
+        try:
+            message = twilio_client.messages.create(
+                from_=twilio_whatsapp_number,
+                to=data['From'],
+                content_sid="HX8e1719f69f8c769ae4cf2ed83e4c2866",  # Template sample_issue_resolution
+                content_variables=content_vars
+            )
+            logger.info(f"Resposta do Twilio: {message.sid} - Status: {message.status}")
+            return {"status": "sucesso", "resultado": result}
+        except Exception as e:
+            logger.error(f"Erro ao enviar mensagem via Twilio: {str(e)}")
+            raise
     else:
         logger.error("Erro na API: %s - %s", response.status_code, response.json())
         return {"status": "error", "mensagem": response.json()}
