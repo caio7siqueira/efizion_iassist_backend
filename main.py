@@ -1,6 +1,5 @@
 import httpx
 import logging
-import json
 from dotenv import load_dotenv
 import os
 from fastapi import FastAPI, Request
@@ -50,18 +49,15 @@ async def webhook(request: Request):
     if response.status_code == 200:
         result = response.json()
         valor = result[0]["valor"]
-        message_body = f"R${valor:,.2f}".replace(",", ".")  # Substituir vírgula por ponto para evitar problemas no JSON
+        message_body = f"Total de vendas: R$ {valor:,.2f}"
         logger.info("Sucesso! Resultado: %s", result)
 
-        # Usar template de teste do sandbox com content_variables como JSON
-        content_vars = json.dumps({"1": "Cliente", "2": message_body}, ensure_ascii=False)
-        logger.info(f"Content variables: {content_vars}")
+        # Enviar resposta como texto livre (sem template, para replies)
         try:
             message = twilio_client.messages.create(
+                body=message_body,
                 from_=twilio_whatsapp_number,
-                to=data['From'],
-                content_sid="HX8e1719f69f8c769ae4cf2ed83e4c2866",  # Template sample_issue_resolution
-                content_variables=content_vars
+                to=data['From']
             )
             logger.info(f"Resposta do Twilio: {message.sid} - Status: {message.status}")
             return {"status": "sucesso", "resultado": result}
