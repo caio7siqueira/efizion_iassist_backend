@@ -1,213 +1,39 @@
+import httpx
+import logging
 from dotenv import load_dotenv
 import os
-import json
-import logging
-import re
-from fastapi import FastAPI, Request, HTTPException
-from supabase import create_client, Client
-from twilio.rest import Client as TwilioClient
-from openai import OpenAI
-import time
-from typing import Dict, Any
 
-# Configuração de logging
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Carregar variáveis de ambiente
-load_dotenv()
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')  # Alterado para SUPABASE_SERVICE_ROLE_KEY
+if not supabase_url or not supabase_key:
+    logger.error("Erro: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não estão definidos no .env")
+    exit(1)
 
-# Variáveis de ambiente
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+cliente_id = "00000000-0000-0000-0000-000000000001"
+entidade_id = "00000000-0000-0000-0000-000000000002"
 
-# Inicialização
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+payload = {
+    "query_text": "SELECT SUM((dados->>'valor_total')::numeric) AS valor FROM registros WHERE cliente_id = $1 AND entidade_id = $2",
+    "param1": cliente_id,
+    "param2": entidade_id
+}
 
-app = FastAPI()
+logger.info(f"Payload enviado: {payload}")
 
-# Função de interpretação com IA
-def interpretar_mensagem(mensagem: str) -> Dict[str, Any]:
-    prompt = """
-    Você é um assistente que interpreta mensagens de gestores e extrai filtros para consulta de indicadores.
-    Sua tarefa é:
-    1. Identificar a intenção (ex.: consultar vendas, lucros, produto mais vendido).
-    2. Extrair filtros como data (ex.: '2023-10', 'este mês'), loja (ex.: 'Loja A'), produto (ex.: 'Camiseta').
-    3. Normalizar datas para o formato 'YYYY-MM' ou 'YYYY' quando aplicável.
-    4. Retorne APENAS o JSON válido, sem texto adicional, explicações ou formatação Markdown. O JSON deve conter: tipo_consulta, indicador_nome, filtros.
+response = httpx.post(
+    f"{supabase_url}/rest/v1/rpc/execute_query",
+    json=payload,
+    headers={"Authorization": f"Bearer {supabase_key}", "apiKey": supabase_key}
+)
 
-    Exemplo de saída (retorne exatamente assim, sem nada mais):
-    {{"tipo_consulta": "indicador", "indicador_nome": "total_vendas", "filtros": {{"data": "2023-10", "loja": "Loja A", "produto": "Camiseta"}}}}
+logger.info(f"Resposta: {response.status_code} - {response.json()}")
 
-    Mensagem recebida: "{}"
-    """.format(mensagem)
-    
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150
-        )
-        conteudo = response.choices[0].message.content.strip()  # Remove espaços e quebras de linha extras
-        
-        # Tentar extrair JSON se houver texto extra (regex para capturar bloco JSON)
-        if not conteudo.startswith('{'):
-            match = re.search(r'\{.*\}', conteudo, re.DOTALL)
-            if match:
-                conteudo = match.group(0)
-        
-        parsed = json.loads(conteudo)
-        return parsed
-    except json.JSONDecodeError as e:
-        logger.error(f"Erro ao parsear JSON da OpenAI. Conteúdo recebido: '{conteudo}'. Erro: {e}")
-        return {"tipo_consulta": "erro", "indicador_nome": "", "filtros": {}}
-    except Exception as e:
-        logger.error(f"Erro ao interpretar mensagem: {e}")
-        return {"tipo_consulta": "erro", "indicador_nome": "", "filtros": {}}
-
-# Função para executar indicadores dinâmicos
-def executar_indicador(cliente_id: str, entidade_id: str, indicador_nome: str, filtros: Dict[str, str]) -> str:
-    try:
-        # Buscar indicador na tabela indicadores
-        indicador = supabase.table("indicadores").select("logica, filtros_padrao, descricao") \
-            .eq("cliente_id", cliente_id) \
-            .eq("nome", indicador_nome).single().execute()
-        
-        if not indicador.data:
-            return f"❌ Indicador '{indicador_nome}' não encontrado."
-        
-        logica_sql = indicador.data["logica"]
-        filtros_padrao = indicador.data["filtros_padrao"] or {}
-        descricao = indicador.data["descricao"]
-        
-        # Validar filtros recebidos contra filtros permitidos
-        filtros_validos = {k: v for k, v in filtros.items() if k in filtros_padrao}
-        
-        # Construir consulta SQL com filtros
-        query_params = {"cliente_id": cliente_id, "entidade_id": entidade_id}
-        where_clauses = []
-        
-        for filtro, valor in filtros_validos.items():
-            # Sanitizar filtros para evitar SQL injection
-            if filtro in ["data", "loja", "produto"]:
-                where_clauses.append(f"dados->>'{filtro}' = :{filtro}")
-                query_params[filtro] = valor
-        
-        # Montar consulta SQL
-        query = logica_sql
-        if "WHERE" in query:
-            if where_clauses:
-                query += " AND " + " AND ".join(where_clauses)
-        else:
-            if where_clauses:
-                query += " WHERE " + " AND ".join(where_clauses)
-        
-        # Executar consulta via RPC
-        result = supabase.rpc("execute_query", {"query": query, "params": query_params}).execute()
-        
-        if not result.data:
-            return "📉 Nenhum dado encontrado para os filtros fornecidos."
-        
-        # Formatar resultado com base no indicador
-        if indicador_nome == "total_vendas":
-            total = sum(row.get("valor", 0) for row in result.data)
-            return f"📊 {descricao}: R$ {total:.2f}"
-        elif indicador_nome == "produto_mais_vendido":
-            if result.data:
-                produto = result.data[0].get("produto", "N/A")
-                quantidade = result.data[0].get("total_quantidade", 0)
-                return f"🏆 {descricao}: {produto} – {quantidade} unidades"
-            return "Nenhum produto encontrado."
-        elif indicador_nome == "vendas_por_genero":
-            resposta = f"📊 {descricao}:\n"
-            for row in result.data:
-                genero = row.get("genero", "N/A")
-                valor = row.get("valor", 0)
-                resposta += f"- {genero}: R$ {valor:.2f}\n"
-            return resposta
-        else:
-            return "📉 Resultado não formatado para este indicador."
-    
-    except Exception as e:
-        logger.error(f"Erro ao executar indicador '{indicador_nome}': {e}")
-        return "❌ Erro ao processar a consulta."
-
-@app.post("/webhook")
-async def whatsapp_webhook(request: Request):
-    start_time = time.time()
-    logger.info("Recebendo webhook do WhatsApp")
-    
-    try:
-        form = await request.form()
-        mensagem = form.get("Body", "").strip()
-        numero = form.get("From", "").replace("whatsapp:", "")
-        
-        if not mensagem or not numero:
-            logger.warning("Mensagem ou número inválidos")
-            raise HTTPException(status_code=400, detail="Mensagem ou número ausentes")
-        
-        # Verificar gestor
-        gestor = supabase.table("gestores").select("cliente_id").eq("telefone_whatsapp", numero).single().execute()
-        
-        if not gestor.data:
-            resposta = "Gestor não autorizado."
-        else:
-            cliente_id = gestor.data["cliente_id"]
-            # Configurar RLS
-            try:
-                supabase.rpc("set_config", {"key": "telefone", "value": numero}).execute()
-            except Exception as e:
-                logger.error(f"Erro ao configurar RLS: {e}")
-                resposta = "❌ Erro ao configurar permissões."
-                twilio_client.messages.create(
-                    body=resposta,
-                    from_=TWILIO_NUMBER,
-                    to=f"whatsapp:{numero}"
-                )
-                return {"status": "erro", "resposta": resposta}
-            
-            # Interpretar mensagem
-            resultado = interpretar_mensagem(mensagem)
-            if resultado.get("tipo_consulta") == "erro":
-                resposta = "❓ Não entendi sua solicitação. Tente reformular."
-            elif resultado.get("tipo_consulta") == "indicador":
-                # Buscar entidade_id associada ao cliente (assumindo uma entidade padrão)
-                entidade = supabase.table("entidades").select("id").eq("cliente_id", cliente_id).limit(1).execute()
-                entidade_id = entidade.data[0]["id"] if entidade.data else None
-                if not entidade_id:
-                    resposta = "❌ Nenhuma entidade encontrada para este cliente."
-                else:
-                    # Executar indicador dinâmico
-                    resposta = executar_indicador(
-                        cliente_id,
-                        entidade_id,
-                        resultado.get("indicador_nome", ""),
-                        resultado.get("filtros", {})
-                    )
-            else:
-                resposta = (
-                    "❓ Comando não reconhecido.\n"
-                    "Envie algo como:\n"
-                    "- 'Total de vendas hoje'\n"
-                    "- 'Produto mais vendido na Loja A'\n"
-                    "- 'Vendas por gênero em 2023'"
-                )
-        
-        # Enviar resposta via Twilio
-        twilio_client.messages.create(
-            body=resposta,
-            from_=TWILIO_NUMBER,
-            to=f"whatsapp:{numero}"
-        )
-        logger.info(f"Webhook processado em {time.time() - start_time:.2f} segundos")
-        return {"status": "mensagem enviada", "resposta": resposta}
-    
-    except Exception as e:
-        logger.error(f"Erro no webhook: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno no servidor")
+if response.status_code == 200:
+    logger.info("Sucesso! Resultado: %s", response.json())
+else:
+    logger.error("Erro na API: %s - %s", response.status_code, response.json())
