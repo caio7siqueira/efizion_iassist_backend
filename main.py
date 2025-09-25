@@ -18,8 +18,7 @@ twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
 twilio_whatsapp_number = os.getenv('TWILIO_WHATSAPP_NUMBER')
 
 if not all([supabase_url, supabase_key, twilio_account_sid, twilio_auth_token, twilio_whatsapp_number]):
-    logger.error(
-        "Erro: Variáveis de ambiente ausentes (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER)")
+    logger.error("Erro: Variáveis de ambiente ausentes")
     exit(1)
 
 twilio_client = Client(twilio_account_sid, twilio_auth_token)
@@ -30,8 +29,8 @@ async def webhook(request: Request):
     data = await request.form()
     logger.info(f"Webhook recebido: {dict(data)}")
 
-    cliente_id = "00000000-0000-0000-0000-000000000001"  # Substitua pela lógica real
-    entidade_id = "00000000-0000-0000-0000-000000000002"  # Substitua pela lógica real
+    cliente_id = "00000000-0000-0000-0000-000000000001"
+    entidade_id = "00000000-0000-0000-0000-000000000002"
 
     payload = {
         "query_text": "SELECT SUM((dados->>'valor_total')::numeric) AS valor FROM registros WHERE cliente_id = $1 AND entidade_id = $2",
@@ -54,11 +53,12 @@ async def webhook(request: Request):
         logger.info("Sucesso! Resultado: %s", result)
 
         # Enviar resposta ao WhatsApp
-        twilio_client.messages.create(
+        message = twilio_client.messages.create(
             body=message_body,
             from_=twilio_whatsapp_number,
             to=data['From']
         )
+        logger.info(f"Resposta do Twilio: {message.sid} - Status: {message.status}")
         return {"status": "sucesso", "resultado": result}
     else:
         logger.error("Erro na API: %s - %s", response.status_code, response.json())
